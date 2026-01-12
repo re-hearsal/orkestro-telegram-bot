@@ -4,11 +4,11 @@ import logging
 import os
 
 import aio_pika
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
 
@@ -53,6 +53,34 @@ class RabbitMQPublisher:
         )
         logger.info("Published user registration to RabbitMQ: %s", payload)
 
+    async def publish_event_rsvp(
+        self,
+        *,
+        event_id: int,
+        decision: str,
+        telegram_user_id: int,
+    ) -> None:
+        if self._channel is None:
+            raise RuntimeError
+
+        payload = {
+            "event_id": event_id,
+            "decision": decision,
+            "telegram_user_id": telegram_user_id,
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        message = aio_pika.Message(
+            body=body,
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        )
+
+        await self._channel.default_exchange.publish(
+            message,
+            routing_key=self._queue_name,
+        )
+        logger.info("Published event RSVP to RabbitMQ: %s", payload)
+
     async def close(self) -> None:
         if self._connection is not None:
             await self._connection.close()
@@ -84,12 +112,51 @@ class RabbitMQNotificationConsumer:
                 payload = json.loads(message.body.decode("utf-8"))
                 chat_id = int(payload["telegram_user_id"])
                 text = str(payload["text"])
+                buttons = payload.get("buttons")
             except Exception:
                 logger.exception("Failed to parse incoming Telegram notification")
                 return
 
+            reply_markup = None
+            if isinstance(buttons, list):
+                inline_buttons: list[InlineKeyboardButton] = []
+                for btn in buttons:
+                    if not isinstance(btn, dict):
+                        continue
+                    if btn.get("type") != "event_rsvp":
+                        continue
+                    event_id = btn.get("event_id")
+                    action = btn.get("action")
+                    if event_id is None or action is None:
+                        continue
+                    if action == "ACCEPT":
+                        label = "Я приду"
+                    elif action == "DECLINE":
+                        label = "Не смогу прийти"
+                    else:
+                        label = str(action)
+                    callback_data = json.dumps(
+                        {"type": "event_rsvp", "event_id": event_id, "action": action},
+                        ensure_ascii=False,
+                    )
+                    inline_buttons.append(InlineKeyboardButton(text=label, callback_data=callback_data))
+                if inline_buttons:
+                    reply_markup = InlineKeyboardMarkup(
+                        inline_keyboard=[inline_buttons],
+                    )
+
             try:
-                await self._bot.send_message(chat_id=chat_id, text=text)
+                if reply_markup is not None:
+                    await self._bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                    )
+                else:
+                    await self._bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                    )
             except Exception:
                 logger.exception("Failed to send Telegram notification to chat_id=%s", chat_id)
 
@@ -100,6 +167,7 @@ class RabbitMQNotificationConsumer:
 
 
 rabbitmq_publisher: RabbitMQPublisher | None = None
+rabbitmq_rsvp_publisher: RabbitMQPublisher | None = None
 rabbitmq_notification_consumer: RabbitMQNotificationConsumer | None = None
 
 
@@ -142,6 +210,42 @@ async def handle_start(message: Message) -> None:
 async def handle_message(message: Message) -> None:
     await message.delete()
 
+
+@router.callback_query(F.data)
+async def handle_callback(callback: CallbackQuery) -> None:
+    if callback.data is None:
+        return
+
+    try:
+        payload = json.loads(callback.data)
+    except Exception:
+        logger.exception("Failed to parse callback data")
+        return
+
+    if payload.get("type") != "event_rsvp":
+        return
+
+    event_id = payload.get("event_id")
+    decision = payload.get("action")
+    user = callback.from_user
+    if user is None or event_id is None or decision is None:
+        return
+
+    if rabbitmq_rsvp_publisher is None:
+        logger.error("RabbitMQ RSVP publisher is not initialized; cannot send RSVP")
+    else:
+        await rabbitmq_rsvp_publisher.publish_event_rsvp(
+            event_id=int(event_id),
+            decision=str(decision),
+            telegram_user_id=user.id,
+        )
+
+    try:
+        await callback.answer("Спасибо, ваш ответ записан.")
+    except Exception:
+        logger.exception("Failed to answer callback query")
+
+
 async def main() -> None:
     load_dotenv()
 
@@ -164,6 +268,10 @@ async def main() -> None:
         "RABBITMQ_TELEGRAM_OUT_QUEUE",
         "telegram_bot_messages",
     )
+    rabbitmq_event_rsvp_queue = os.getenv(
+        "RABBITMQ_EVENT_RSVP_QUEUE",
+        "telegram_event_rsvp",
+    )
 
     global rabbitmq_publisher
     rabbitmq_publisher = RabbitMQPublisher(
@@ -171,6 +279,13 @@ async def main() -> None:
         queue_name=rabbitmq_queue,
     )
     await rabbitmq_publisher.connect()
+
+    global rabbitmq_rsvp_publisher
+    rabbitmq_rsvp_publisher = RabbitMQPublisher(
+        url=rabbitmq_url,
+        queue_name=rabbitmq_event_rsvp_queue,
+    )
+    await rabbitmq_rsvp_publisher.connect()
 
     bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     global rabbitmq_notification_consumer
@@ -190,6 +305,8 @@ async def main() -> None:
         logger.info("Shutting down Telegram bot")
         if rabbitmq_publisher is not None:
             await rabbitmq_publisher.close()
+        if rabbitmq_rsvp_publisher is not None:
+            await rabbitmq_rsvp_publisher.close()
         if rabbitmq_notification_consumer is not None:
             await rabbitmq_notification_consumer.close()
 
