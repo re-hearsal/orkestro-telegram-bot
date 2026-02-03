@@ -90,12 +90,17 @@ async def test_publisher_and_consumer_integration_via_dummy_broker() -> None:
         out_queue = channel.queues["out_queue"]
 
         # Публикуем сообщение через publisher и проверяем, что оно попадает в нужную очередь
-        await publisher.publish_user_registration(token="t-1", telegram_user_id=555)
+        await publisher.publish_user_registration(request_id="req-1", token="t-1", telegram_user_id=555)
         assert channel.default_exchange.published, "Publisher did not publish any messages"
 
         body, routing_key = channel.default_exchange.published[0]
         assert routing_key == "reg_queue"
-        assert json.loads(body.decode("utf-8")) == {"token": "t-1", "telegram_user_id": 555}
+        assert json.loads(body.decode("utf-8")) == {
+            "request_id": "req-1",
+            "type": "telegram.link",
+            "token": "t-1",
+            "telegram_user_id": 555,
+        }
 
         # Теперь эмулируем сообщение от backend в очередь, которую слушает consumer,
         # и проверяем, что бот отправляет сообщение пользователю.

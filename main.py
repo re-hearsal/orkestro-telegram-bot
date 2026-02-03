@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 
 import aio_pika
 from aiogram import Bot, Dispatcher, Router, F
@@ -11,10 +12,16 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
+from config import MESSAGES, RABBIT_CONTRACT
+
 
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+REQUEST_TYPE_TELEGRAM_LINK = RABBIT_CONTRACT.request_type_telegram_link
+REQUEST_TYPE_EVENT_RSVP = RABBIT_CONTRACT.request_type_event_rsvp
+TELEGRAM_BUTTON_TYPE_EVENT_RSVP = RABBIT_CONTRACT.button_type_event_rsvp
 
 
 class RabbitMQPublisher:
@@ -35,16 +42,29 @@ class RabbitMQPublisher:
         )
         logger.info("Connected to RabbitMQ, queue=%s", self._queue_name)
 
-    async def publish_user_registration(self, *, token: str, telegram_user_id: int) -> None:
+    async def publish_user_registration(
+        self,
+        *,
+        request_id: str,
+        token: str,
+        telegram_user_id: int,
+    ) -> None:
         if self._channel is None:
             raise RuntimeError
 
-        payload = {"token": token, "telegram_user_id": telegram_user_id}
+        payload = {
+            "request_id": request_id,
+            "type": REQUEST_TYPE_TELEGRAM_LINK,
+            "token": token,
+            "telegram_user_id": telegram_user_id,
+        }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         message = aio_pika.Message(
             body=body,
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            content_type=RABBIT_CONTRACT.content_type,
+            content_encoding=RABBIT_CONTRACT.content_encoding,
         )
 
         await self._channel.default_exchange.publish(
@@ -56,6 +76,7 @@ class RabbitMQPublisher:
     async def publish_event_rsvp(
         self,
         *,
+        request_id: str,
         event_id: int,
         decision: str,
         telegram_user_id: int,
@@ -64,6 +85,8 @@ class RabbitMQPublisher:
             raise RuntimeError
 
         payload = {
+            "request_id": request_id,
+            "type": REQUEST_TYPE_EVENT_RSVP,
             "event_id": event_id,
             "decision": decision,
             "telegram_user_id": telegram_user_id,
@@ -73,6 +96,8 @@ class RabbitMQPublisher:
         message = aio_pika.Message(
             body=body,
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            content_type=RABBIT_CONTRACT.content_type,
+            content_encoding=RABBIT_CONTRACT.content_encoding,
         )
 
         await self._channel.default_exchange.publish(
@@ -94,6 +119,44 @@ class RabbitMQNotificationConsumer:
         self._bot = bot
         self._connection: aio_pika.RobustConnection | None = None
         self._channel: aio_pika.abc.AbstractChannel | None = None
+        self._pending: dict[str, tuple[int, int]] = {}
+        self._pending_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pending_lock = asyncio.Lock()
+        self._pending_timeout_seconds = int(os.getenv("PENDING_TIMEOUT_SECONDS", "20"))
+
+    async def track_request(self, *, request_id: str, chat_id: int, message_id: int) -> None:
+        async with self._pending_lock:
+            self._pending[request_id] = (chat_id, message_id)
+            existing = self._pending_tasks.pop(request_id, None)
+            if existing is not None:
+                existing.cancel()
+            self._pending_tasks[request_id] = asyncio.create_task(self._timeout_request(request_id))
+
+    async def _timeout_request(self, request_id: str) -> None:
+        await asyncio.sleep(self._pending_timeout_seconds)
+        async with self._pending_lock:
+            pending = self._pending.pop(request_id, None)
+            self._pending_tasks.pop(request_id, None)
+
+        if pending is None:
+            return
+        chat_id, message_id = pending
+        try:
+            await self._bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=MESSAGES.timeout_waiting_backend,
+            )
+        except Exception:
+            logger.exception("Failed to send timeout result for request_id=%s", request_id)
+
+    async def _pop_pending(self, request_id: str) -> tuple[int, int] | None:
+        async with self._pending_lock:
+            pending = self._pending.pop(request_id, None)
+            task = self._pending_tasks.pop(request_id, None)
+            if task is not None:
+                task.cancel()
+            return pending
 
     async def start(self) -> None:
         logger.info("Connecting to RabbitMQ for incoming Telegram notifications at %s", self._url)
@@ -113,6 +176,7 @@ class RabbitMQNotificationConsumer:
                 chat_id = int(payload["telegram_user_id"])
                 text = str(payload["text"])
                 buttons = payload.get("buttons")
+                request_id = payload.get("request_id")
             except Exception:
                 logger.exception("Failed to parse incoming Telegram notification")
                 return
@@ -123,20 +187,20 @@ class RabbitMQNotificationConsumer:
                 for btn in buttons:
                     if not isinstance(btn, dict):
                         continue
-                    if btn.get("type") != "event_rsvp":
+                    if btn.get("type") != TELEGRAM_BUTTON_TYPE_EVENT_RSVP:
                         continue
                     event_id = btn.get("event_id")
                     action = btn.get("action")
                     if event_id is None or action is None:
                         continue
                     if action == "ACCEPT":
-                        label = "Я приду"
+                        label = MESSAGES.button_label_accept
                     elif action == "DECLINE":
-                        label = "Не смогу прийти"
+                        label = MESSAGES.button_label_decline
                     else:
                         label = str(action)
                     callback_data = json.dumps(
-                        {"type": "event_rsvp", "event_id": event_id, "action": action},
+                        {"type": TELEGRAM_BUTTON_TYPE_EVENT_RSVP, "event_id": event_id, "action": action},
                         ensure_ascii=False,
                     )
                     inline_buttons.append(InlineKeyboardButton(text=label, callback_data=callback_data))
@@ -146,6 +210,25 @@ class RabbitMQNotificationConsumer:
                     )
 
             try:
+                # If this message is a result for a pending request, try to edit the "processing" message.
+                if request_id and reply_markup is None:
+                    pending = await self._pop_pending(str(request_id))
+                    if pending is not None:
+                        pending_chat_id, pending_message_id = pending
+                        try:
+                            await self._bot.edit_message_text(
+                                chat_id=pending_chat_id,
+                                message_id=pending_message_id,
+                                text=text,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to edit pending message for request_id=%s; falling back to send_message",
+                                request_id,
+                            )
+                        else:
+                            return
+
                 if reply_markup is not None:
                     await self._bot.send_message(
                         chat_id=chat_id,
@@ -186,24 +269,32 @@ async def handle_start(message: Message) -> None:
 
     if not token:
         await message.answer(
-            ("Чтобы подключить Telegram-уведомления, перейдите к боту по ссылке из личного кабинета приложения."),
+            (MESSAGES.link_no_token_instruction),
         )
         logger.warning("Received /start without token from telegram_user_id=%s", user_id)
         return
 
-    await message.answer(
-        (
-            "✅ Телеграм-уведомления успешно подключены.\n\n"
-            "Теперь важные уведомления будут приходить вам сюда, "
-            "в личные сообщения от этого бота."
-        ),
-    )
+    processing = await message.answer(MESSAGES.link_processing)
 
-    if rabbitmq_publisher is None:
-        logger.error("RabbitMQ publisher is not initialized; cannot send user_id")
+    if rabbitmq_publisher is None or rabbitmq_notification_consumer is None:
+        logger.error("RabbitMQ is not initialized; cannot send user registration request")
+        try:
+            await processing.edit_text(MESSAGES.service_unavailable)
+        except Exception:
+            logger.exception("Failed to edit processing message")
         return
 
-    await rabbitmq_publisher.publish_user_registration(token=token, telegram_user_id=user_id)
+    request_id = uuid.uuid4().hex
+    await rabbitmq_notification_consumer.track_request(
+        request_id=request_id,
+        chat_id=processing.chat.id,
+        message_id=processing.message_id,
+    )
+    await rabbitmq_publisher.publish_user_registration(
+        request_id=request_id,
+        token=token,
+        telegram_user_id=user_id,
+    )
 
 
 @router.message()
@@ -222,7 +313,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
         logger.exception("Failed to parse callback data")
         return
 
-    if payload.get("type") != "event_rsvp":
+    if payload.get("type") != TELEGRAM_BUTTON_TYPE_EVENT_RSVP:
         return
 
     event_id = payload.get("event_id")
@@ -231,19 +322,36 @@ async def handle_callback(callback: CallbackQuery) -> None:
     if user is None or event_id is None or decision is None:
         return
 
-    if rabbitmq_rsvp_publisher is None:
-        logger.error("RabbitMQ RSVP publisher is not initialized; cannot send RSVP")
-    else:
-        await rabbitmq_rsvp_publisher.publish_event_rsvp(
-            event_id=int(event_id),
-            decision=str(decision),
-            telegram_user_id=user.id,
-        )
-
     try:
-        await callback.answer("Спасибо, ваш ответ записан.")
+        await callback.answer(MESSAGES.rsvp_callback_ack)
     except Exception:
         logger.exception("Failed to answer callback query")
+
+    if callback.message is None:
+        return
+
+    processing = await callback.message.answer(MESSAGES.rsvp_processing)
+
+    if rabbitmq_rsvp_publisher is None or rabbitmq_notification_consumer is None:
+        logger.error("RabbitMQ is not initialized; cannot send RSVP request")
+        try:
+            await processing.edit_text(MESSAGES.service_unavailable)
+        except Exception:
+            logger.exception("Failed to edit processing message")
+        return
+
+    request_id = uuid.uuid4().hex
+    await rabbitmq_notification_consumer.track_request(
+        request_id=request_id,
+        chat_id=processing.chat.id,
+        message_id=processing.message_id,
+    )
+    await rabbitmq_rsvp_publisher.publish_event_rsvp(
+        request_id=request_id,
+        event_id=int(event_id),
+        decision=str(decision),
+        telegram_user_id=user.id,
+    )
 
 
 async def main() -> None:
