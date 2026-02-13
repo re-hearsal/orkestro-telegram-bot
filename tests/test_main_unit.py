@@ -7,6 +7,17 @@ import pytest
 import main
 
 
+def test_normalize_notification_text_repairs_mojibake() -> None:
+    broken = "â Telegram-ÑÐ²ÐµÐ´Ð¾Ð¼Ð»ÐµÐ½Ð¸Ñ ÑÑÐ¿ÐµÑÐ½Ð¾ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐµÐ½Ñ Ðº Ð²Ð°ÑÐµÐ¼Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÑ."
+    fixed = main._normalize_notification_text(broken)
+    assert fixed == "✅ Telegram-уведомления успешно подключены к вашему аккаунту."
+
+
+def test_normalize_notification_text_keeps_valid_text() -> None:
+    text = "✅ Telegram-уведомления успешно подключены к вашему аккаунту."
+    assert main._normalize_notification_text(text) == text
+
+
 class DummyUser:
     def __init__(self, user_id: int) -> None:
         self.id = user_id
