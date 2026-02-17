@@ -236,6 +236,7 @@ async def test_handle_start_with_token_publishes_to_rabbitmq_and_answers() -> No
         request_id="req-1",
         chat_id=777,
         message_id=1,
+        locale="ru",
     )
     mock_publisher.publish_user_registration.assert_awaited_once_with(
         request_id="req-1",

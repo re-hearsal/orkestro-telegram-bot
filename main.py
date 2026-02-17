@@ -12,7 +12,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
-from config import MESSAGES, RABBIT_CONTRACT
+from config import I18N_MESSAGES, RABBIT_CONTRACT, BotMessagesConfig
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,41 @@ def _normalize_notification_text(text: str) -> str:
     if _mojibake_char_count(repaired) < _mojibake_char_count(text) and _cyrillic_char_count(repaired) >= _cyrillic_char_count(text):
         return repaired
     return text
+
+
+_user_locales: dict[int, str] = {}
+
+
+def _normalize_locale(raw_locale: str | None) -> str:
+    if not raw_locale:
+        return "ru"
+    locale = raw_locale.lower()
+    if locale.startswith("en"):
+        return "en"
+    return "ru"
+
+
+def _messages_for_locale(locale: str | None) -> BotMessagesConfig:
+    normalized = _normalize_locale(locale)
+    return I18N_MESSAGES.en if normalized == "en" else I18N_MESSAGES.ru
+
+
+def _messages_for_chat(chat_id: int) -> BotMessagesConfig:
+    return _messages_for_locale(_user_locales.get(chat_id))
+
+
+def _extract_payload_locale(payload: dict[str, object]) -> str | None:
+    raw_locale = payload.get("locale")
+    if not isinstance(raw_locale, str):
+        return None
+    return _normalize_locale(raw_locale)
+
+
+def _preferred_locale_for_user(user_id: int, telegram_language_code: str | None) -> str:
+    cached = _user_locales.get(user_id)
+    if cached is not None:
+        return cached
+    return _normalize_locale(telegram_language_code)
 
 
 class RabbitMQPublisher:
@@ -143,14 +178,21 @@ class RabbitMQNotificationConsumer:
         self._bot = bot
         self._connection: aio_pika.RobustConnection | None = None
         self._channel: aio_pika.abc.AbstractChannel | None = None
-        self._pending: dict[str, tuple[int, int]] = {}
+        self._pending: dict[str, tuple[int, int, str]] = {}
         self._pending_tasks: dict[str, asyncio.Task[None]] = {}
         self._pending_lock = asyncio.Lock()
         self._pending_timeout_seconds = int(os.getenv("PENDING_TIMEOUT_SECONDS", "20"))
 
-    async def track_request(self, *, request_id: str, chat_id: int, message_id: int) -> None:
+    async def track_request(
+        self,
+        *,
+        request_id: str,
+        chat_id: int,
+        message_id: int,
+        locale: str = "ru",
+    ) -> None:
         async with self._pending_lock:
-            self._pending[request_id] = (chat_id, message_id)
+            self._pending[request_id] = (chat_id, message_id, locale)
             existing = self._pending_tasks.pop(request_id, None)
             if existing is not None:
                 existing.cancel()
@@ -164,17 +206,18 @@ class RabbitMQNotificationConsumer:
 
         if pending is None:
             return
-        chat_id, message_id = pending
+        chat_id, message_id, locale = pending
+        texts = _messages_for_locale(locale)
         try:
             await self._bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=MESSAGES.timeout_waiting_backend,
+                text=texts.timeout_waiting_backend,
             )
         except Exception:
             logger.exception("Failed to send timeout result for request_id=%s", request_id)
 
-    async def _pop_pending(self, request_id: str) -> tuple[int, int] | None:
+    async def _pop_pending(self, request_id: str) -> tuple[int, int, str] | None:
         async with self._pending_lock:
             pending = self._pending.pop(request_id, None)
             task = self._pending_tasks.pop(request_id, None)
@@ -201,9 +244,14 @@ class RabbitMQNotificationConsumer:
                 text = _normalize_notification_text(str(payload["text"]))
                 buttons = payload.get("buttons")
                 request_id = payload.get("request_id")
+                payload_locale = _extract_payload_locale(payload)
             except Exception:
                 logger.exception("Failed to parse incoming Telegram notification")
                 return
+
+            if payload_locale is not None:
+                _user_locales[chat_id] = payload_locale
+            button_texts = _messages_for_locale(payload_locale) if payload_locale is not None else _messages_for_chat(chat_id)
 
             reply_markup = None
             if isinstance(buttons, list):
@@ -218,9 +266,9 @@ class RabbitMQNotificationConsumer:
                     if event_id is None or action is None:
                         continue
                     if action == "ACCEPT":
-                        label = MESSAGES.button_label_accept
+                        label = button_texts.button_label_accept
                     elif action == "DECLINE":
-                        label = MESSAGES.button_label_decline
+                        label = button_texts.button_label_decline
                     else:
                         label = str(action)
                     callback_data = json.dumps(
@@ -238,7 +286,7 @@ class RabbitMQNotificationConsumer:
                 if request_id and reply_markup is None:
                     pending = await self._pop_pending(str(request_id))
                     if pending is not None:
-                        pending_chat_id, pending_message_id = pending
+                        pending_chat_id, pending_message_id, _pending_locale = pending
                         try:
                             await self._bot.edit_message_text(
                                 chat_id=pending_chat_id,
@@ -286,6 +334,9 @@ async def handle_start(message: Message) -> None:
         return
 
     user_id = user.id
+    locale = _preferred_locale_for_user(user_id, getattr(user, "language_code", None))
+    _user_locales[user_id] = locale
+    texts = _messages_for_locale(locale)
 
     text = message.text or ""
     parts = text.split(maxsplit=1)
@@ -293,17 +344,17 @@ async def handle_start(message: Message) -> None:
 
     if not token:
         await message.answer(
-            (MESSAGES.link_no_token_instruction),
+            texts.link_no_token_instruction,
         )
         logger.warning("Received /start without token from telegram_user_id=%s", user_id)
         return
 
-    processing = await message.answer(MESSAGES.link_processing)
+    processing = await message.answer(texts.link_processing)
 
     if rabbitmq_publisher is None or rabbitmq_notification_consumer is None:
         logger.error("RabbitMQ is not initialized; cannot send user registration request")
         try:
-            await processing.edit_text(MESSAGES.service_unavailable)
+            await processing.edit_text(texts.service_unavailable)
         except Exception:
             logger.exception("Failed to edit processing message")
         return
@@ -313,6 +364,7 @@ async def handle_start(message: Message) -> None:
         request_id=request_id,
         chat_id=processing.chat.id,
         message_id=processing.message_id,
+        locale=locale,
     )
     await rabbitmq_publisher.publish_user_registration(
         request_id=request_id,
@@ -345,21 +397,24 @@ async def handle_callback(callback: CallbackQuery) -> None:
     user = callback.from_user
     if user is None or event_id is None or decision is None:
         return
+    locale = _preferred_locale_for_user(user.id, getattr(user, "language_code", None))
+    _user_locales[user.id] = locale
+    texts = _messages_for_locale(locale)
 
     try:
-        await callback.answer(MESSAGES.rsvp_callback_ack)
+        await callback.answer(texts.rsvp_callback_ack)
     except Exception:
         logger.exception("Failed to answer callback query")
 
     if callback.message is None:
         return
 
-    processing = await callback.message.answer(MESSAGES.rsvp_processing)
+    processing = await callback.message.answer(texts.rsvp_processing)
 
     if rabbitmq_rsvp_publisher is None or rabbitmq_notification_consumer is None:
         logger.error("RabbitMQ is not initialized; cannot send RSVP request")
         try:
-            await processing.edit_text(MESSAGES.service_unavailable)
+            await processing.edit_text(texts.service_unavailable)
         except Exception:
             logger.exception("Failed to edit processing message")
         return
@@ -369,6 +424,7 @@ async def handle_callback(callback: CallbackQuery) -> None:
         request_id=request_id,
         chat_id=processing.chat.id,
         message_id=processing.message_id,
+        locale=locale,
     )
     await rabbitmq_rsvp_publisher.publish_event_rsvp(
         request_id=request_id,
