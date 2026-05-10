@@ -24,30 +24,6 @@ REQUEST_TYPE_EVENT_RSVP = RABBIT_CONTRACT.request_type_event_rsvp
 TELEGRAM_BUTTON_TYPE_EVENT_RSVP = RABBIT_CONTRACT.button_type_event_rsvp
 
 
-_MOJIBAKE_MARKERS = ("Ð", "Ñ", "â", "Â", "Ã")
-
-
-def _cyrillic_char_count(text: str) -> int:
-    return sum(1 for ch in text if ("А" <= ch <= "я") or ch in ("Ё", "ё"))
-
-
-def _mojibake_char_count(text: str) -> int:
-    return sum(text.count(marker) for marker in _MOJIBAKE_MARKERS)
-
-
-def _normalize_notification_text(text: str) -> str:
-    if not any(marker in text for marker in _MOJIBAKE_MARKERS):
-        return text
-    try:
-        repaired = text.encode("latin-1").decode("utf-8")
-    except UnicodeError:
-        return text
-
-    if _mojibake_char_count(repaired) < _mojibake_char_count(text) and _cyrillic_char_count(repaired) >= _cyrillic_char_count(text):
-        return repaired
-    return text
-
-
 _user_locales: dict[int, str] = {}
 
 
@@ -241,7 +217,7 @@ class RabbitMQNotificationConsumer:
             try:
                 payload = json.loads(message.body.decode("utf-8"))
                 chat_id = int(payload["telegram_user_id"])
-                text = _normalize_notification_text(str(payload["text"]))
+                text = str(payload["text"])
                 buttons = payload.get("buttons")
                 request_id = payload.get("request_id")
                 payload_locale = _extract_payload_locale(payload)
