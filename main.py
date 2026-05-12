@@ -227,7 +227,9 @@ class RabbitMQNotificationConsumer:
 
             if payload_locale is not None:
                 _user_locales[chat_id] = payload_locale
-            button_texts = _messages_for_locale(payload_locale) if payload_locale is not None else _messages_for_chat(chat_id)
+            button_texts = (
+                _messages_for_locale(payload_locale) if payload_locale is not None else _messages_for_chat(chat_id)
+            )
 
             reply_markup = None
             if isinstance(buttons, list):

@@ -68,7 +68,9 @@ I18N_MESSAGES: Final[I18nBotMessagesConfig] = I18nBotMessagesConfig(
             "To connect Telegram notifications, open the bot from the link in your account settings.",
         ),
         link_processing=_env("BOT_MSG_LINK_PROCESSING_EN", "⏳ Connecting Telegram notifications..."),
-        service_unavailable=_env("BOT_MSG_SERVICE_UNAVAILABLE_EN", "❌ Service is temporarily unavailable. Please try again later."),
+        service_unavailable=_env(
+            "BOT_MSG_SERVICE_UNAVAILABLE_EN", "❌ Service is temporarily unavailable. Please try again later."
+        ),
         timeout_waiting_backend=_env(
             "BOT_MSG_TIMEOUT_WAITING_BACKEND_EN",
             "❌ Failed to get a response from the server. Please try again in a moment.",
@@ -79,4 +81,3 @@ I18N_MESSAGES: Final[I18nBotMessagesConfig] = I18nBotMessagesConfig(
         button_label_decline=_env("BOT_LABEL_RSVP_DECLINE_EN", "I cannot attend"),
     ),
 )
-

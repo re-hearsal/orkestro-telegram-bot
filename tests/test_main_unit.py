@@ -48,7 +48,9 @@ class DummyMessage:
 
     async def answer(self, text: str) -> DummySentMessage:
         self.answers.append(text)
-        sent = DummySentMessage(chat_id=self.from_user.id if self.from_user else 0, message_id=self._next_message_id, text=text)
+        sent = DummySentMessage(
+            chat_id=self.from_user.id if self.from_user else 0, message_id=self._next_message_id, text=text
+        )
         self._next_message_id += 1
         return sent
 
@@ -221,11 +223,15 @@ async def test_handle_start_with_token_publishes_to_rabbitmq_and_answers() -> No
         def __init__(self, hex_value: str) -> None:
             self.hex = hex_value
 
-    with patch.object(main, "rabbitmq_publisher", new=mock_publisher), patch.object(
-        main,
-        "rabbitmq_notification_consumer",
-        new=mock_consumer,
-    ), patch.object(main.uuid, "uuid4", return_value=DummyUuid("req-1")):
+    with (
+        patch.object(main, "rabbitmq_publisher", new=mock_publisher),
+        patch.object(
+            main,
+            "rabbitmq_notification_consumer",
+            new=mock_consumer,
+        ),
+        patch.object(main.uuid, "uuid4", return_value=DummyUuid("req-1")),
+    ):
         await main.handle_start(message)  # type: ignore[arg-type]
 
     # Отправили "processing" сообщение
@@ -249,7 +255,10 @@ async def test_handle_start_with_token_publishes_to_rabbitmq_and_answers() -> No
 async def test_handle_start_broker_not_initialized_logs_error_and_does_not_crash() -> None:
     message = DummyMessage(text="/start token", user_id=123)
 
-    with patch.object(main, "rabbitmq_publisher", new=None), patch.object(main, "rabbitmq_notification_consumer", new=None):
+    with (
+        patch.object(main, "rabbitmq_publisher", new=None),
+        patch.object(main, "rabbitmq_notification_consumer", new=None),
+    ):
         await main.handle_start(message)  # type: ignore[arg-type]
 
     # Сначала отправили processing
@@ -290,11 +299,15 @@ async def test_handle_callback_publishes_event_rsvp() -> None:
         def __init__(self, hex_value: str) -> None:
             self.hex = hex_value
 
-    with patch.object(main, "rabbitmq_rsvp_publisher", new=mock_rsvp_publisher), patch.object(
-        main,
-        "rabbitmq_notification_consumer",
-        new=mock_consumer,
-    ), patch.object(main.uuid, "uuid4", return_value=DummyUuid("req-2")):
+    with (
+        patch.object(main, "rabbitmq_rsvp_publisher", new=mock_rsvp_publisher),
+        patch.object(
+            main,
+            "rabbitmq_notification_consumer",
+            new=mock_consumer,
+        ),
+        patch.object(main.uuid, "uuid4", return_value=DummyUuid("req-2")),
+    ):
         await main.handle_callback(dummy_callback)  # type: ignore[arg-type]
 
     mock_consumer.track_request.assert_awaited_once()
